@@ -1,10 +1,22 @@
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional
 
-async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int, db_session=None) -> Decimal:
+CENTS = Decimal("0.01")
+
+
+def round_money(amount) -> Decimal:
     """
-    Calculates revenue for a specific month.
+    Business rule: sum the exact stored amounts first, then round the total once
+    to cents using ROUND_HALF_UP. Individual reservations are never rounded.
+    """
+    return Decimal(str(amount)).quantize(CENTS, rounding=ROUND_HALF_UP)
+
+
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int, db_session=None) -> Dict[str, Decimal]:
+    """
+    Calculates revenue for a specific month, as {currency: total}.
+    Amounts in different currencies are never added together.
 
     A reservation belongs to the month of its check-in date in the property's
     local timezone (properties.timezone), using a half-open interval:
@@ -23,7 +35,7 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
     # timestamp AT TIME ZONE tz converts local wall-clock time to an absolute instant,
     # so DST shifts are handled per property by Postgres
     query = text("""
-        SELECT COALESCE(SUM(r.total_amount), 0) as total
+        SELECT r.currency, SUM(r.total_amount) as total
         FROM reservations r
         JOIN properties p
             ON p.id = r.property_id AND p.tenant_id = r.tenant_id
@@ -31,6 +43,7 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
         AND r.tenant_id = :tenant_id
         AND r.check_in_date >= (CAST(:start_date AS timestamp) AT TIME ZONE p.timezone)
         AND r.check_in_date < (CAST(:end_date AS timestamp) AT TIME ZONE p.timezone)
+        GROUP BY r.currency
     """)
     params = {
         "property_id": property_id,
@@ -41,7 +54,7 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
 
     if db_session is not None:
         result = await db_session.execute(query, params)
-        return Decimal(str(result.scalar_one()))
+        return {row.currency: round_money(row.total) for row in result}
 
     from app.core.database_pool import DatabasePool
 
@@ -52,12 +65,16 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
 
     async with db_pool.get_session() as session:
         result = await session.execute(query, params)
-        return Decimal(str(result.scalar_one()))
+        return {row.currency: round_money(row.total) for row in result}
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
     """
-    Aggregates revenue from database.
+    Aggregates revenue from database, grouped by currency.
     Returns None when the property does not belong to the tenant.
+
+    "total"/"currency" are only set when all reservations share one currency;
+    with mixed currencies callers must use the "totals" breakdown, since there
+    is no defined conversion rule.
     """
     try:
         # Import database pool
@@ -75,34 +92,46 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Optional[
                 # Start from properties so a property owned by another tenant yields no row
                 query = text("""
                     SELECT
-                        p.id AS property_id,
-                        COALESCE(SUM(r.total_amount), 0) as total_revenue,
+                        r.currency,
+                        SUM(r.total_amount) as total_revenue,
                         COUNT(r.id) as reservation_count
                     FROM properties p
                     LEFT JOIN reservations r
                         ON r.property_id = p.id AND r.tenant_id = p.tenant_id
                     WHERE p.id = :property_id AND p.tenant_id = :tenant_id
-                    GROUP BY p.id
+                    GROUP BY r.currency
+                    ORDER BY r.currency
                 """)
                 
                 result = await session.execute(query, {
                     "property_id": property_id, 
                     "tenant_id": tenant_id
                 })
-                row = result.fetchone()
+                rows = result.fetchall()
                 
-                if row:
-                    total_revenue = Decimal(str(row.total_revenue))
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": str(total_revenue),
-                        "currency": "USD", 
-                        "count": row.reservation_count
-                    }
-                else:
+                if not rows:
                     # Property not found for this tenant
                     return None
+
+                # A property without reservations yields one row with a NULL currency
+                totals = [
+                    {
+                        "currency": row.currency,
+                        "total": str(round_money(row.total_revenue)),
+                        "count": row.reservation_count,
+                    }
+                    for row in rows
+                    if row.currency is not None
+                ]
+                single = totals[0] if len(totals) == 1 else None
+                return {
+                    "property_id": property_id,
+                    "tenant_id": tenant_id,
+                    "total": single["total"] if single else ("0.00" if not totals else None),
+                    "currency": single["currency"] if single else None,
+                    "totals": totals,
+                    "count": sum(t["count"] for t in totals)
+                }
         else:
             raise Exception("Database pool not available")
 

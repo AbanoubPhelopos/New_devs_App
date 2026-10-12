@@ -25,11 +25,12 @@ async def get_dashboard_summary(
         # Same response as a non-existent property, so other tenants' IDs are not revealed
         raise HTTPException(status_code=404, detail="Property not found")
 
-    total_revenue_float = float(revenue_data['total'])
-    
+    # Money is serialised as a decimal string (already rounded to cents), never a float.
+    # total_revenue/currency are null when reservations span several currencies.
     return {
         "property_id": revenue_data['property_id'],
-        "total_revenue": total_revenue_float,
+        "total_revenue": revenue_data['total'],
         "currency": revenue_data['currency'],
+        "totals_by_currency": revenue_data['totals'],
         "reservations_count": revenue_data['count']
     }

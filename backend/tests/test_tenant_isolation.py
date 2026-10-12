@@ -11,9 +11,9 @@ from app.services import cache, reservations
 
 # Both tenants own a property called prop-001; prop-002 belongs to tenant-a only.
 REVENUE = {
-    ("tenant-a", "prop-001"): {"total": "2250.000", "count": 4},
-    ("tenant-b", "prop-001"): {"total": "0", "count": 0},
-    ("tenant-a", "prop-002"): {"total": "4975.500", "count": 4},
+    ("tenant-a", "prop-001"): {"total": "2250.00", "count": 4},
+    ("tenant-b", "prop-001"): {"total": "0.00", "count": 0},
+    ("tenant-a", "prop-002"): {"total": "4975.50", "count": 4},
 }
 
 
@@ -46,8 +46,9 @@ def fake_db(monkeypatch):
         row = REVENUE.get((tenant_id, property_id))
         if row is None:
             return None
-        return {"property_id": property_id, "tenant_id": tenant_id,
-                "total": row["total"], "currency": "USD", "count": row["count"]}
+        totals = [{"currency": "USD", "total": row["total"], "count": row["count"]}] if row["count"] else []
+        return {"property_id": property_id, "tenant_id": tenant_id, "total": row["total"],
+                "currency": "USD" if totals else None, "totals": totals, "count": row["count"]}
 
     monkeypatch.setattr(reservations, "calculate_total_revenue", calculate_total_revenue)
 
@@ -71,8 +72,8 @@ async def test_cache_key_includes_tenant(fake_redis, fake_db):
 async def test_same_property_id_is_cached_separately_per_tenant(fake_redis, fake_db):
     a = await cache.get_revenue_summary("prop-001", "tenant-a")
     b = await cache.get_revenue_summary("prop-001", "tenant-b")
-    assert a["total"] == "2250.000" and a["tenant_id"] == "tenant-a"
-    assert b["total"] == "0" and b["tenant_id"] == "tenant-b"
+    assert a["total"] == "2250.00" and a["tenant_id"] == "tenant-a"
+    assert b["total"] == "0.00" and b["tenant_id"] == "tenant-b"
 
 
 @pytest.mark.anyio
@@ -92,7 +93,7 @@ async def test_missing_tenant_is_rejected(fake_redis, fake_db):
 def test_tenant_can_read_own_property(fake_redis, fake_db):
     res = client_for("tenant-a").get("/api/v1/dashboard/summary", params={"property_id": "prop-001"})
     assert res.status_code == 200
-    assert res.json()["total_revenue"] == 2250.0
+    assert res.json()["total_revenue"] == "2250.00"
     assert res.json()["reservations_count"] == 4
 
 
@@ -100,7 +101,7 @@ def test_login_as_a_then_b_does_not_reveal_a_data(fake_redis, fake_db):
     client_for("tenant-a").get("/api/v1/dashboard/summary", params={"property_id": "prop-001"})
     res = client_for("tenant-b").get("/api/v1/dashboard/summary", params={"property_id": "prop-001"})
     assert res.status_code == 200
-    assert res.json()["total_revenue"] == 0
+    assert res.json()["total_revenue"] == "0.00"
     assert res.json()["reservations_count"] == 0
 
 
