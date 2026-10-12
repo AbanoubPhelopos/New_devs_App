@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
     """
@@ -31,9 +31,10 @@ async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_
     
     return Decimal('0') # Placeholder for now until DB connection is finalized
 
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+async def calculate_total_revenue(property_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
     """
     Aggregates revenue from database.
+    Returns None when the property does not belong to the tenant.
     """
     try:
         # Import database pool
@@ -48,14 +49,17 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                 # Use SQLAlchemy text for raw SQL
                 from sqlalchemy import text
                 
+                # Start from properties so a property owned by another tenant yields no row
                 query = text("""
-                    SELECT 
-                        property_id,
-                        SUM(total_amount) as total_revenue,
-                        COUNT(*) as reservation_count
-                    FROM reservations 
-                    WHERE property_id = :property_id AND tenant_id = :tenant_id
-                    GROUP BY property_id
+                    SELECT
+                        p.id AS property_id,
+                        COALESCE(SUM(r.total_amount), 0) as total_revenue,
+                        COUNT(r.id) as reservation_count
+                    FROM properties p
+                    LEFT JOIN reservations r
+                        ON r.property_id = p.id AND r.tenant_id = p.tenant_id
+                    WHERE p.id = :property_id AND p.tenant_id = :tenant_id
+                    GROUP BY p.id
                 """)
                 
                 result = await session.execute(query, {
@@ -74,36 +78,12 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                         "count": row.reservation_count
                     }
                 else:
-                    # No reservations found for this property
-                    return {
-                        "property_id": property_id,
-                        "tenant_id": tenant_id,
-                        "total": "0.00",
-                        "currency": "USD",
-                        "count": 0
-                    }
+                    # Property not found for this tenant
+                    return None
         else:
             raise Exception("Database pool not available")
-            
+
     except Exception as e:
+        # Never fall back to fabricated figures: they ignore the tenant and can leak across clients
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
-        return {
-            "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
-            "currency": "USD",
-            "count": mock_property_data['count']
-        }
+        raise
